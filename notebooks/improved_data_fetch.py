@@ -38,6 +38,71 @@ def test_connection():
         return False
 
 
+def _format_bytes(num_bytes):
+    """Return human-readable size for a byte count."""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num_bytes)
+    unit_idx = 0
+    while size >= 1024 and unit_idx < len(units) - 1:
+        size /= 1024.0
+        unit_idx += 1
+    return f"{size:.2f} {units[unit_idx]}"
+
+
+def estimate_table_size_bytes(share, schema, table, profile_path="credentials/config.share"):
+    """Estimate remote size of a table by summing file sizes from Delta Sharing (no download)."""
+    try:
+        client = delta_sharing.SharingClient(profile_path)
+        target = None
+        for t in client.list_all_tables():
+            if t.share == share and t.schema == schema and t.name == table:
+                target = t
+                break
+        if not target:
+            return 0
+
+        # Use underlying REST client to list files; response contains add_files with .size
+        resp = client._rest_client.list_files_in_table(target)
+        files = getattr(resp, "add_files", []) or []
+        sizes = [getattr(f, "size", 0) for f in files]
+        return int(sum(sizes))
+    except Exception:
+        return 0
+
+
+def preflight_estimate_and_confirm():
+    """Show per-table and total remote sizes, then ask whether to proceed with full fetch."""
+    tables = list_tables()
+    if not tables:
+        print("❌ No tables available for size estimation")
+        return False
+
+    print("\n🧮 Estimating remote sizes (no data download)...")
+    per_table_sizes = []
+    total_bytes = 0
+    for t in tables:
+        size_bytes = estimate_table_size_bytes(t.share, t.schema, t.name)
+        total_bytes += size_bytes
+        per_table_sizes.append((t, size_bytes))
+
+    print("\n📏 Estimated sizes by table:")
+    for t, sz in per_table_sizes:
+        print(f"   - {t.share}.{t.schema}.{t.name}: {_format_bytes(sz)}")
+
+    print(f"\n🧩 Estimated total size: {_format_bytes(total_bytes)}")
+
+    # Prompt for confirmation
+    try:
+        answer = input("\nProceed with full fetch and save locally? [y/N]: ").strip().lower()
+    except EOFError:
+        answer = "n"
+
+    proceed = answer in ("y", "yes")
+    if not proceed:
+        print("🚫 Skipping full fetch per user choice.")
+    return proceed
+
+
 def fetch_table_with_timeout(share, schema, table, timeout=30):
     """Fetch table with timeout and better error handling"""
     try:
@@ -154,8 +219,13 @@ def main():
     sample_df = fetch_single_table_sample()
     
     if sample_df is not None:
-        print("\n🎉 Single table test successful! Proceeding with full fetch...")
-        all_dfs = fetch_all_tables_improved()
+        print("\n🎉 Single table test successful!")
+        # Preflight: estimate sizes and confirm before fetching all
+        if preflight_estimate_and_confirm():
+            print("\n🚀 Proceeding with full fetch...")
+            all_dfs = fetch_all_tables_improved()
+        else:
+            all_dfs = {}
         
         if all_dfs:
             print(f"\n🎊 Successfully fetched {len(all_dfs)} tables!")
@@ -177,5 +247,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
